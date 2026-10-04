@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import rethinkdb as r
+from rethinkdb import r
+from twisted.internet import defer
+from twisted.logger import Logger
 
 import cowrie.core.output
 from cowrie.core.config import CowrieConfig
@@ -27,6 +29,10 @@ RETHINK_DB_SEGMENT = "output_rethinkdblog"
 
 
 class Output(cowrie.core.output.Output):
+    _log = Logger()
+
+    connection = None
+
     # noinspection PyAttributeOutsideInit
     def start(self):
         self.host = CowrieConfig.get(RETHINK_DB_SEGMENT, "host")
@@ -34,20 +40,33 @@ class Output(cowrie.core.output.Output):
         self.db = CowrieConfig.get(RETHINK_DB_SEGMENT, "db")
         self.table = CowrieConfig.get(RETHINK_DB_SEGMENT, "table")
         self.password = CowrieConfig.get(RETHINK_DB_SEGMENT, "password", raw=True)
-        self.connection = r.connect(
-            host=self.host, port=self.port, db=self.db, password=self.password
-        )
+        r.set_loop_type("twisted")
+        self.connect()
+
+    @defer.inlineCallbacks
+    def connect(self):
         try:
-            r.db_create(self.db).run(self.connection)
-            r.db(self.db).table_create(self.table).run(self.connection)
+            connection = yield r.connect(
+                host=self.host, port=self.port, db=self.db, password=self.password
+            )
+        except r.ReqlError as e:
+            self._log.error("output_rethinkdblog: connect failed: {error}", error=e)
+            return
+        try:
+            yield r.db_create(self.db).run(connection)
+            yield r.db(self.db).table_create(self.table).run(connection)
         except r.RqlRuntimeError:
             pass
+        self.connection = connection
 
     def stop(self):
-        if hasattr(self, "connection"):
+        if self.connection is not None:
             self.connection.close()
 
     def write(self, event):
+        if self.connection is None:
+            return
+
         for i in list(event):
             # remove twisted 15 legacy keys
             if i.startswith("log_"):
@@ -56,4 +75,11 @@ class Output(cowrie.core.output.Output):
         if "timestamp" in event:
             event["timestamp"] = iso8601_to_timestamp(event["timestamp"])
 
-        r.table(self.table).insert(event).run(self.connection)
+        d = r.table(self.table).insert(event).run(self.connection)
+        d.addErrback(self.insert_failed)
+
+    def insert_failed(self, failure):
+        self._log.error(
+            "output_rethinkdblog: insert failed: {error}",
+            error=failure.getErrorMessage(),
+        )
